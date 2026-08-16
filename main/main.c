@@ -37,6 +37,16 @@
 #include "sdmmc_cmd.h"
 #include "sdkconfig.h"
 
+/* ===== CCAPI Remote: Wi-Fi / UDP / NVS ===== */
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include "cJSON.h"
+
 #ifndef CONFIG_IDF_TARGET
 #define CONFIG_IDF_TARGET "esp32"
 #endif
@@ -233,6 +243,7 @@ typedef enum {
     UI_PAGE_ADC33,
     UI_PAGE_SYSTEM,
     UI_PAGE_ABOUT,
+    UI_PAGE_CCAPI_REMOTE,
     UI_PAGE_COUNT,
 } ui_page_t;
 
@@ -334,6 +345,26 @@ static uint8_t s_light_hist_count;
 static uint32_t s_therm_accum;
 static uint16_t s_therm_accum_count;
 static uint32_t s_last_therm_publish_ms;
+
+/* ===== CCAPI Remote global state ===== */
+#define CCAPI_UDP_PORT      5005
+#define CCAPI_PC_IP_DEFAULT "192.168.3.228"
+static char     s_ccapi_ssid[32]       = "";
+static char     s_ccapi_pwd[64]        = "";
+static char     s_ccapi_pc_ip[20]      = CCAPI_PC_IP_DEFAULT;
+static char     s_ccapi_status[28]     = "STANDBY";
+static char     s_ccapi_rec_time[12]   = "00:00:00";
+static char     s_ccapi_fps[8]         = "30P";
+static bool     s_ccapi_recording      = false;
+static bool     s_ccapi_wifi_ok        = false;
+static int      s_ccapi_udp_sock       = -1;
+static lv_obj_t *s_ccapi_lbl_status    = NULL;
+static lv_obj_t *s_ccapi_lbl_fps       = NULL;
+static lv_obj_t *s_ccapi_lbl_time      = NULL;
+static lv_obj_t *s_ccapi_lbl_wifi      = NULL;
+static lv_obj_t *s_ccapi_bg            = NULL;
+static TickType_t s_ccapi_right_press_tick = 0;
+static bool       s_ccapi_right_holding   = false;
 
 static int pct_from_raw(int raw)
 {
@@ -1303,6 +1334,7 @@ static const char *const s_page_names[UI_PAGE_COUNT] = {
     "GPIO33",
     "SYSTEM",
     "ABOUT",
+    "CCAPI",
 };
 
 static const uint32_t UI_YELLOW = 0xF6D34A;
@@ -1622,6 +1654,146 @@ static void ui_build_about_page(lv_obj_t *page)
     s_ui.chart_series = NULL;
 }
 
+
+/* ===================================================================
+ * CCAPI Remote: NVS / Wi-Fi / UDP helpers
+ * =================================================================== */
+
+static void ccapi_load_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("ccapi_cfg", NVS_READONLY, &h) != ESP_OK) return;
+    size_t len;
+    len = sizeof(s_ccapi_ssid);   nvs_get_str(h, "ssid",  s_ccapi_ssid,  &len);
+    len = sizeof(s_ccapi_pwd);    nvs_get_str(h, "pwd",   s_ccapi_pwd,   &len);
+    len = sizeof(s_ccapi_pc_ip);  nvs_get_str(h, "pc_ip", s_ccapi_pc_ip, &len);
+    nvs_close(h);
+    ESP_LOGI(TAG, "CCAPI NVS: ssid=%s pc_ip=%s", s_ccapi_ssid, s_ccapi_pc_ip);
+}
+
+static void ccapi_send_udp(const char *cmd, const char *payload)
+{
+    if (s_ccapi_udp_sock < 0 || !s_ccapi_wifi_ok) return;
+    char buf[128];
+    if (payload)
+        snprintf(buf, sizeof(buf), "{\"cmd\":\"%s\",\"payload\":\"%s\"}", cmd, payload);
+    else
+        snprintf(buf, sizeof(buf), "{\"cmd\":\"%s\",\"payload\":null}", cmd);
+    struct sockaddr_in dst = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(CCAPI_UDP_PORT),
+        .sin_addr.s_addr = inet_addr(s_ccapi_pc_ip),
+    };
+    sendto(s_ccapi_udp_sock, buf, strlen(buf), 0, (struct sockaddr *)&dst, sizeof(dst));
+    ESP_LOGI(TAG, "UDP -> %s", buf);
+}
+
+static void ccapi_udp_recv_task(void *arg)
+{
+    (void)arg;
+    char rx[256];
+    struct sockaddr_in addr;
+    struct sockaddr_in client;
+    socklen_t cl_len = sizeof(client);
+
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(CCAPI_UDP_PORT);
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) { vTaskDelete(NULL); return; }
+    bind(sock, (struct sockaddr *)&addr, sizeof(addr));
+    s_ccapi_udp_sock = sock;
+
+    while (1) {
+        int n = recvfrom(sock, rx, sizeof(rx) - 1, 0,
+                         (struct sockaddr *)&client, &cl_len);
+        if (n <= 0) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        rx[n] = '\0';
+        cJSON *j = cJSON_Parse(rx);
+        if (!j) continue;
+
+        cJSON *jstatus = cJSON_GetObjectItem(j, "cam_status");
+        cJSON *jtime   = cJSON_GetObjectItem(j, "rec_time");
+        cJSON *jfps    = cJSON_GetObjectItem(j, "fps_display");
+
+        if (cJSON_IsString(jstatus)) {
+            const char *v = jstatus->valuestring;
+            if (strstr(v, "Recording") || strstr(v, "recording") || strstr(v, "\xe6\xad\xa3\xe5\x9c\xa8\xe5\xbd\x95\xe5\x88\xb6")) {
+                snprintf(s_ccapi_status, sizeof(s_ccapi_status), "REC");
+                s_ccapi_recording = true;
+            } else {
+                snprintf(s_ccapi_status, sizeof(s_ccapi_status), "STANDBY");
+                s_ccapi_recording = false;
+            }
+        }
+        if (cJSON_IsString(jtime))
+            snprintf(s_ccapi_rec_time, sizeof(s_ccapi_rec_time), "%s", jtime->valuestring);
+        if (cJSON_IsString(jfps)) {
+            const char *v = jfps->valuestring;
+            if (strstr(v, "60") || strstr(v, "59"))
+                snprintf(s_ccapi_fps, sizeof(s_ccapi_fps), "60P");
+            else if (strstr(v, "24") || strstr(v, "23"))
+                snprintf(s_ccapi_fps, sizeof(s_ccapi_fps), "24P");
+            else
+                snprintf(s_ccapi_fps, sizeof(s_ccapi_fps), "30P");
+        }
+        cJSON_Delete(j);
+    }
+}
+
+static void ccapi_wifi_event_handler(void *arg, esp_event_base_t base,
+                                     int32_t event_id, void *event_data)
+{
+    if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_ccapi_wifi_ok = false;
+        copy_text(s_ccapi_status, sizeof(s_ccapi_status), "NO WIFI");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *ev = (ip_event_got_ip_t *)event_data;
+        snprintf(s_ccapi_ssid, sizeof(s_ccapi_ssid), IPSTR, IP2STR(&ev->ip_info.ip));
+        s_ccapi_wifi_ok = true;
+        copy_text(s_ccapi_status, sizeof(s_ccapi_status), "STANDBY");
+        ESP_LOGI(TAG, "CCAPI Wi-Fi got IP: " IPSTR, IP2STR(&ev->ip_info.ip));
+        if (s_ccapi_udp_sock < 0) {
+            xTaskCreate(ccapi_udp_recv_task, "ccapi_udp", 4096, NULL, 4, NULL);
+        }
+    }
+}
+
+static void ccapi_wifi_init(void)
+{
+    ccapi_load_nvs();
+    if (strlen(s_ccapi_ssid) == 0) {
+        ESP_LOGW(TAG, "CCAPI: No SSID in NVS, Wi-Fi skipped.");
+        copy_text(s_ccapi_status, sizeof(s_ccapi_status), "NO SSID");
+        return;
+    }
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                               ccapi_wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                               ccapi_wifi_event_handler, NULL));
+
+    wifi_config_t wcfg = {0};
+    strncpy((char *)wcfg.sta.ssid,     s_ccapi_ssid, sizeof(wcfg.sta.ssid) - 1);
+    strncpy((char *)wcfg.sta.password, s_ccapi_pwd,  sizeof(wcfg.sta.password) - 1);
+    wcfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wcfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "CCAPI Wi-Fi connecting to: %s", s_ccapi_ssid);
+}
+
 static void ui_build_page_content(lv_obj_t *page)
 {
     char idx[10];
@@ -1640,6 +1812,51 @@ static void ui_build_page_content(lv_obj_t *page)
 
     if (s_ui.page_id == UI_PAGE_ABOUT) {
         ui_build_about_page(page);
+        return;
+    }
+
+    if (s_ui.page_id == UI_PAGE_CCAPI_REMOTE) {
+        s_ccapi_bg = page;
+        lv_obj_set_style_bg_color(page, lv_color_hex(0x1B1713), 0);
+
+        s_ccapi_lbl_status = lv_label_create(page);
+        lv_label_set_text(s_ccapi_lbl_status, s_ccapi_status);
+        lv_obj_set_pos(s_ccapi_lbl_status, 8, 30);
+        lv_obj_set_style_text_font(s_ccapi_lbl_status, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(s_ccapi_lbl_status, lv_color_hex(0xE64B3C), 0);
+
+        s_ccapi_lbl_fps = lv_label_create(page);
+        lv_label_set_text(s_ccapi_lbl_fps, s_ccapi_fps);
+        lv_obj_set_pos(s_ccapi_lbl_fps, 118, 30);
+        lv_obj_set_style_text_font(s_ccapi_lbl_fps, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(s_ccapi_lbl_fps, lv_color_hex(0xF6D34A), 0);
+
+        s_ccapi_lbl_time = lv_label_create(page);
+        lv_label_set_text(s_ccapi_lbl_time, s_ccapi_rec_time);
+        lv_obj_set_pos(s_ccapi_lbl_time, 8, 58);
+        lv_obj_set_style_text_font(s_ccapi_lbl_time, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(s_ccapi_lbl_time, lv_color_hex(0xFFF3B0), 0);
+
+        s_ccapi_lbl_wifi = lv_label_create(page);
+        lv_label_set_text_fmt(s_ccapi_lbl_wifi, "%s  %s",
+                              s_ccapi_wifi_ok ? "WiFi OK" : "No WiFi",
+                              s_ccapi_pc_ip);
+        lv_obj_set_pos(s_ccapi_lbl_wifi, 8, 80);
+        lv_obj_set_style_text_font(s_ccapi_lbl_wifi, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(s_ccapi_lbl_wifi, lv_color_hex(0x5C4220), 0);
+
+        s_ui.hint = lv_label_create(page);
+        lv_label_set_text(s_ui.hint, "A:REC  R:AF  U:FPS  L:menu");
+        lv_obj_set_pos(s_ui.hint, 8, 106);
+        lv_obj_set_style_text_font(s_ui.hint, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(s_ui.hint, lv_color_hex(0x5C4220), 0);
+
+        s_ui.value = NULL;
+        s_ui.sub   = NULL;
+        s_ui.bar   = NULL;
+        s_ui.chart = NULL;
+        s_ui.chart_head = NULL;
+        s_ui.chart_series = NULL;
         return;
     }
 
@@ -1842,6 +2059,25 @@ static void ui_refresh(void)
         break;
     case UI_PAGE_ABOUT:
         break;
+    case UI_PAGE_CCAPI_REMOTE:
+        if (s_ccapi_lbl_status) {
+            if (s_ccapi_recording) {
+                lv_label_set_text(s_ccapi_lbl_status, "● REC");
+                lv_obj_set_style_text_color(s_ccapi_lbl_status, lv_color_hex(0xFF0000), 0);
+            } else {
+                lv_label_set_text(s_ccapi_lbl_status, s_ccapi_status);
+                lv_obj_set_style_text_color(s_ccapi_lbl_status, lv_color_hex(0xE64B3C), 0);
+            }
+        }
+        if (s_ccapi_lbl_fps)
+            lv_label_set_text(s_ccapi_lbl_fps, s_ccapi_fps);
+        if (s_ccapi_lbl_time)
+            lv_label_set_text(s_ccapi_lbl_time, s_ccapi_rec_time);
+        if (s_ccapi_lbl_wifi)
+            lv_label_set_text_fmt(s_ccapi_lbl_wifi, "%s  %s",
+                                  s_ccapi_wifi_ok ? "WiFi OK" : "No WiFi",
+                                  s_ccapi_pc_ip);
+        break;
     default:
         break;
     }
@@ -1958,6 +2194,18 @@ static void ui_action(void)
         err = s_board.i2c_ready ? ESP_OK : ESP_ERR_INVALID_STATE;
         set_action(s_board.i2c_ready ? "Rescanned" : "I2C init fail");
         break;
+    case UI_PAGE_CCAPI_REMOTE:
+        if (s_ccapi_recording) {
+            ccapi_send_udp("POST_REC", "stop");
+            s_ccapi_recording = false;
+            snprintf(s_ccapi_status, sizeof(s_ccapi_status), "STOPPING");
+        } else {
+            ccapi_send_udp("POST_REC", "start");
+            s_ccapi_recording = true;
+            snprintf(s_ccapi_status, sizeof(s_ccapi_status), "STARTING");
+        }
+        buzzer_beep(s_ccapi_recording ? 880 : 440, 80);
+        break;
     default:
         break;
     }
@@ -2032,6 +2280,14 @@ static void ui_cancel(void)
             set_action("Motor2 dir");
         }
         break;
+    case UI_PAGE_CCAPI_REMOTE:
+        if (s_ccapi_recording) {
+            ccapi_send_udp("POST_REC", "stop");
+            s_ccapi_recording = false;
+            snprintf(s_ccapi_status, sizeof(s_ccapi_status), "STOPPING");
+            buzzer_beep(440, 80);
+        }
+        break;
     default:
         buzzer_stop();
         set_action("Canceled");
@@ -2104,6 +2360,52 @@ static void ui_key_event_cb(lv_event_t *e)
     }
 
     const uint32_t key = lv_event_get_key(e);
+
+    if (s_ui.page_id == UI_PAGE_CCAPI_REMOTE) {
+        if (key == LV_KEY_RIGHT) {
+            ccapi_send_udp("AF_CTRL", "oneshot");
+            snprintf(s_ccapi_status, sizeof(s_ccapi_status), "AF...");
+            buzzer_beep(2600, 25);
+            ui_refresh();
+            return;
+        }
+        if (key == LV_KEY_UP) {
+            if (strcmp(s_ccapi_fps, "60P") == 0) {
+                snprintf(s_ccapi_fps, sizeof(s_ccapi_fps), "30P");
+                ccapi_send_udp("SET_FPS", "30P");
+            } else if (strcmp(s_ccapi_fps, "30P") == 0) {
+                snprintf(s_ccapi_fps, sizeof(s_ccapi_fps), "24P");
+                ccapi_send_udp("SET_FPS", "24P");
+            } else {
+                snprintf(s_ccapi_fps, sizeof(s_ccapi_fps), "60P");
+                ccapi_send_udp("SET_FPS", "60P");
+            }
+            buzzer_beep(660, 35);
+            ui_refresh();
+            return;
+        }
+        if (key == LV_KEY_DOWN) {
+            ccapi_send_udp("SET_FORMAT", "ipblight");
+            buzzer_beep(660, 35);
+            ui_refresh();
+            return;
+        }
+        if (key == LV_KEY_ENTER) {
+            ui_action();
+            ui_refresh();
+            return;
+        }
+        if (key == LV_KEY_ESC) {
+            ui_cancel();
+            ui_refresh();
+            return;
+        }
+        if (key == LV_KEY_LEFT) {
+            ui_show_page(UI_PAGE_ABOUT, -1);
+            return;
+        }
+        return;
+    }
 
     if (key == LV_KEY_LEFT || key == LV_KEY_RIGHT) {
         int next = (int)s_ui.page_id + (key == LV_KEY_RIGHT ? 1 : -1);
@@ -2206,6 +2508,17 @@ static void lvgl_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Xiaomiao LVGL 9.5 dashboard boot");
+
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    ccapi_wifi_init();
 
     sensor_history_init();
     buttons_init();
