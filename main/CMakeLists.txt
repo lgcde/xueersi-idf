@@ -13,6 +13,11 @@ idf_component_register(SRCS "main.c"
                                      fatfs
                                      sdmmc
                                      lvgl
+                                     esp_wifi
+                                     esp_event
+                                     nvs_flash
+                                     lwip
+                                     json
                        INCLUDE_DIRS "")
 
 target_link_libraries(${COMPONENT_LIB} PRIVATE m)
