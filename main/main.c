@@ -363,8 +363,6 @@ static lv_obj_t *s_ccapi_lbl_fps       = NULL;
 static lv_obj_t *s_ccapi_lbl_time      = NULL;
 static lv_obj_t *s_ccapi_lbl_wifi      = NULL;
 static lv_obj_t *s_ccapi_bg            = NULL;
-static TickType_t s_ccapi_right_press_tick = 0;
-static bool       s_ccapi_right_holding   = false;
 
 static int pct_from_raw(int raw)
 {
@@ -794,7 +792,6 @@ static void sd_try_mount(void)
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot_config.host_id = LCD_HOST;
     slot_config.gpio_cs = PIN_NUM_SD_CS;
-    slot_config.wait_for_miso = 20;
 
     esp_vfs_fat_mount_config_t mount_config = VFS_FAT_MOUNT_DEFAULT_CONFIG();
     mount_config.format_if_mount_failed = false;
