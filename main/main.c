@@ -120,7 +120,7 @@
 #define LCD_H_RES                   160
 #define LCD_V_RES                   128
 #define LCD_DRAW_BUF_LINES          LCD_V_RES
-#define LCD_DRAW_BUF_COUNT          3
+#define LCD_DRAW_BUF_COUNT          2
 #define LCD_DPI                     60
 #define LCD_CMD_BITS                8
 #define LCD_PARAM_BITS              8
@@ -1269,13 +1269,6 @@ static esp_lcd_panel_io_handle_t lcd_init(void)
 
 static lv_display_t *lvgl_display_init(esp_lcd_panel_io_handle_t io_handle)
 {
-#if LCD_DRAW_BUF_LINES != LCD_V_RES
-#error "Triple/full refresh mode requires LCD_DRAW_BUF_LINES to equal LCD_V_RES"
-#endif
-#if LCD_DRAW_BUF_COUNT != 3
-#error "This build is configured for full-screen triple buffering"
-#endif
-
     lv_display_t *display = lv_display_create(LCD_H_RES, LCD_V_RES);
     assert(display);
 
@@ -1284,23 +1277,12 @@ static lv_display_t *lvgl_display_init(esp_lcd_panel_io_handle_t io_handle)
     const size_t draw_buffer_sz = stride * LCD_DRAW_BUF_LINES;
     void *buf1 = spi_bus_dma_memory_alloc(LCD_HOST, draw_buffer_sz, 0);
     void *buf2 = spi_bus_dma_memory_alloc(LCD_HOST, draw_buffer_sz, 0);
-    void *buf3 = spi_bus_dma_memory_alloc(LCD_HOST, draw_buffer_sz, 0);
     assert(buf1);
     assert(buf2);
-    assert(buf3);
 
     lv_display_set_color_format(display, color_format);
     lv_display_set_dpi(display, LCD_DPI);
     lv_display_set_buffers(display, buf1, buf2, draw_buffer_sz, LV_DISPLAY_RENDER_MODE_FULL);
-    lv_result_t res = lv_draw_buf_init(&s_draw_buf3,
-                                       LCD_H_RES,
-                                       LCD_DRAW_BUF_LINES,
-                                       color_format,
-                                       stride,
-                                       buf3,
-                                       draw_buffer_sz);
-    assert(res == LV_RESULT_OK);
-    lv_display_set_3rd_draw_buffer(display, &s_draw_buf3);
     lv_display_set_user_data(display, io_handle);
     lv_display_set_flush_cb(display, lvgl_flush_cb);
 
